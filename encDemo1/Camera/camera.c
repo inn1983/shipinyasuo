@@ -52,7 +52,8 @@ void *CreateCameraContext()
 }
 
 void DestroyCameraContext(void* v4l2ctx)
-{
+{
+
 	DestroyV4l2Context(v4l2ctx);
 }
 
@@ -69,7 +70,7 @@ void CloseCamera(void* v4l2ctx)
 int StartCamera(void* v4l2ctx, int *width, int *height)
 {
 	int ret = 0;
-	int pix_fmt = V4L2_PIX_FMT_NV12;
+	int pix_fmt = V4L2_PIX_FMT_YUYV;
 	int mframerate = 30;
 	int mbuffernuber = BUFFER_NUMBER;
 

@@ -22,7 +22,7 @@ extern "C" {
 #include <sys/time.h>
 #include "cedarv_osal_linux.h"
 
-unsigned int mwidth = 640;
+unsigned int mwidth = 720;
 unsigned int mheight = 480;
 
 #define ENCODE_H264 
@@ -43,16 +43,61 @@ typedef struct Venc_context
 	WaterMark*	waterMark;
 }Venc_context;
 
+static void yuyv_nv12(const unsigned char *pyuyv, unsigned char *pnv12, int width, int height)
+{
+	unsigned char *Y = pnv12;
+	unsigned char *UV = Y + width * height;
+	//unsigned char *V = U + width * height / 4;
+	int i, j;
+
+	for (i = 0; i < height / 2; i++) {
+		// 奇数行保留 U/V
+		for (j = 0; j < width / 2; j++) {
+			*Y++ = *pyuyv++;
+			*UV++ = *pyuyv++;	//U
+			*Y++ = *pyuyv++;
+			*UV++ = *pyuyv++;	//V
+		}
+
+		// 偶数行的 UV 直接扔掉
+		for (j = 0; j < width / 2; j++) {
+			*Y++ = *pyuyv++;
+			pyuyv++;		// 跳过 U
+			*Y++ = *pyuyv++;
+			pyuyv++;		// 跳过 V
+		}
+	}
+
+#ifdef DUMP_YUV420P
+	// 使用 ffmpeg -s <width>x<height> -pix_fmt yuv420p -i img-xx.yuv img-xx.jpg
+	// 然后检查 img-xx.jpg 是否正确？
+	// 经过检查，此处 yuv420p 图像正常，这么说，肯定是 GetFrmBufCB() 里面设置问题了 :(
+#define CNT 10
+	static int _ind = 0;
+	char fname[128];
+	snprintf(fname, sizeof(fname), "img-%02d.yuv", _ind);
+	_ind++;
+	_ind %= CNT;
+	FILE *fp = fopen(fname, "wb");
+	if (fp) {
+		fwrite(q, 1, width*height*3/2, fp);
+		fclose(fp);
+	}
+#endif // 
+}
 
 int CameraSourceCallback(void *cookie,  void *data)
 {
 	Venc_context * venc_cam_cxt = (Venc_context *)cookie;
 	cedarv_encoder_t *venc_device = venc_cam_cxt->venc_device;
 	AWCameraDevice *CameraDevice = venc_cam_cxt->CameraDevice;
-
+	static int has_alloc_buffer = 0;
+	
 	VencInputBuffer input_buffer;
 	int result = 0;
-	int has_alloc_buffer = 0;
+	//int has_alloc_buffer = 0;
+	
+
 	struct v4l2_buffer *p_buf = (struct v4l2_buffer *)data;
 	v4l2_mem_map_t* p_v4l2_mem_map = GetMapmemAddress(getV4L2ctx(CameraDevice));	
 
@@ -60,14 +105,23 @@ int CameraSourceCallback(void *cookie,  void *data)
 	int size_y = venc_cam_cxt->base_cfg.input_width*venc_cam_cxt->base_cfg.input_height; 
 
 	memset(&input_buffer, 0, sizeof(VencInputBuffer));
+	
+	result = venc_device->ioctrl(venc_device, VENC_CMD_GET_ALLOCATE_INPUT_BUFFER, &input_buffer);
+	
+	if(result != 0) {
+		LOGD("no alloc input buffer right now");
+		usleep(10*1000);
+		return -1;
+	}
+	yuyv_nv12( (unsigned char*)buffer, input_buffer.addrvirY, 720, 480);
+	
+	//input_buffer.id = p_buf->index;
+	//input_buffer.addrphyY = p_buf->m.offset;
+	//input_buffer.addrphyC = p_buf->m.offset + size_y;
 
-	input_buffer.id = p_buf->index;
-	input_buffer.addrphyY = p_buf->m.offset;
-	input_buffer.addrphyC = p_buf->m.offset + size_y;
-
-	LOGD("buffer address is %x", buffer);
-	input_buffer.addrvirY = buffer;
-	input_buffer.addrvirC = buffer + size_y;
+	//LOGD("buffer address is %x", buffer);
+	//input_buffer.addrvirY = buffer;
+	//input_buffer.addrvirC = buffer + size_y;
 
 	input_buffer.pts = 1000000 * (long long)p_buf->timestamp.tv_sec + (long long)p_buf->timestamp.tv_usec;
 	LOGD("pts = %ll", input_buffer.pts);
@@ -84,7 +138,7 @@ int CameraSourceCallback(void *cookie,  void *data)
 
     // enquene buffer to input buffer quene
     
-	//LOGD("ID = %d\n", input_buffer.id);
+	LOGD("ID = %d\n", input_buffer.id);
 	result = venc_device->ioctrl(venc_device, VENC_CMD_ENQUENE_INPUT_BUFFER, &input_buffer);
 
 	if(result < 0) {
@@ -120,7 +174,7 @@ static void* EncoderThread(void* pThreadData) {
 
 		if(result<0)
 		{
-			//LOGV("enquene input buffer is empty");
+			LOGV("enquene input buffer is empty");
 			usleep(10*1000);
 			continue;
 		}
@@ -134,6 +188,9 @@ static void* EncoderThread(void* pThreadData) {
 				input_buffer.addrvirY + venc_cam_cxt->waterMark->bgInfo.width * venc_cam_cxt->waterMark->bgInfo.height * 3/2, 0);
 
 		result = venc_device->ioctrl(venc_device, VENC_CMD_ENCODE, &input_buffer);
+		
+		// return the buffer to the alloc buffer quene after encoder
+		venc_device->ioctrl(venc_device, VENC_CMD_RETURN_ALLOCATE_INPUT_BUFFER, &input_buffer);
 
 		CameraDevice->returnFrame(CameraDevice, input_buffer.id);
 		
@@ -191,12 +248,19 @@ static void* EncoderThread(void* pThreadData) {
 	return (void*)0;
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	if(argc != 2)
+	{
+		printf("Usage: ./CapH264enc outputfile\n");
+		exit(-1);
+	}
+	
 
 	int err = 0;
 	motion_par motionPar;
 	Venc_context *venc_cam_cxt = (Venc_context *)malloc(sizeof(Venc_context));
+	VencAllocateBufferParam alloc_parm;
 
 	memset(venc_cam_cxt, 0, sizeof(Venc_context));
 
@@ -215,7 +279,10 @@ int main()
 	venc_cam_cxt->base_cfg.maxKeyInterval = 25;
 	venc_cam_cxt->base_cfg.inputformat = VENC_PIXEL_YUV420; //uv combined
 	venc_cam_cxt->base_cfg.targetbitrate = 3*1024*1024;
-
+	
+	// init allocate param
+	alloc_parm.buffernum = 4;
+	
 	LOGD("cedarx_hardware_init");
 	cedarx_hardware_init(0);
 	
@@ -235,12 +302,13 @@ int main()
 
 	venc_cam_cxt->venc_device = cedarvEncInit();
 	venc_cam_cxt->venc_device->ioctrl(venc_cam_cxt->venc_device, VENC_CMD_BASE_CONFIG, &venc_cam_cxt->base_cfg);
+	venc_cam_cxt->venc_device->ioctrl(venc_cam_cxt->venc_device, VENC_CMD_ALLOCATE_INPUT_BUFFER, &alloc_parm);
 	venc_cam_cxt->venc_device->ioctrl(venc_cam_cxt->venc_device, VENC_CMD_OPEN, 0);
 	venc_cam_cxt->venc_device->ioctrl(venc_cam_cxt->venc_device, VENC_CMD_HEADER_DATA, &venc_cam_cxt->header_data);
 	venc_cam_cxt->venc_device->ioctrl(venc_cam_cxt->venc_device, VENC_CMD_SET_MOTION_PAR_FLAG, &motionPar);
 
 #ifdef ENCODE_H264
-	venc_cam_cxt->out_file = fopen("/mnt/out1.h264", "wb");
+	venc_cam_cxt->out_file = fopen(argv[1], "wb");
 #else
 	venc_cam_cxt->out_file = fopen("/mnt/out1.jpg", "wb");
 #endif
