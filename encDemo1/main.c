@@ -343,7 +343,7 @@ int main(int argc, char **argv)
 		LOGE("Create thread_enc_id fail !\n");
 	}
 
-	sleep(30);
+	sleep(600);
 
     /* stop encoder */
 	venc_cam_cxt->mstart = 0;
